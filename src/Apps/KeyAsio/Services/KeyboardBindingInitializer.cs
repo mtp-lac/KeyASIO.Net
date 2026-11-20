@@ -38,6 +38,7 @@ public class KeyboardBindingInitializer
     private readonly IPlaybackEngine _playbackEngine;
     private readonly GameplaySessionManager _gameplaySessionManager;
     private readonly SfxPlaybackService _sfxPlaybackService;
+    private readonly NativeSamplePlaybackService? _nativeSamples;
     private readonly SkinManager _skinManager;
     private readonly ApplicationState _sharedViewModel;
 
@@ -58,7 +59,8 @@ public class KeyboardBindingInitializer
         GameplaySessionManager gameplaySessionManager,
         SfxPlaybackService sfxPlaybackService,
         SkinManager skinManager,
-        ApplicationState sharedViewModel)
+        ApplicationState sharedViewModel,
+        NativeSamplePlaybackService? nativeSamples = null)
     {
         _logger = logger;
         _appSettings = appSettings;
@@ -68,6 +70,7 @@ public class KeyboardBindingInitializer
         _sfxPlaybackService = sfxPlaybackService;
         _skinManager = skinManager;
         _sharedViewModel = sharedViewModel;
+        _nativeSamples = nativeSamples;
     }
 
     public void Setup()
@@ -149,6 +152,7 @@ public class KeyboardBindingInitializer
 
             if (_appSettings.Sync.EnableSync)
             {
+                if (_nativeSamples?.IsEnabled == true) return;
                 _playbackBuffer.Clear();
 
                 var sequencer = _gameplaySessionManager.CurrentHitsoundSequencer;

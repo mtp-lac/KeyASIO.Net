@@ -68,6 +68,8 @@ public sealed class LazerIpcGameSyncSource : IGameSyncSource
 
     private void OnChannelConnectionChanged(LazerIpcChannel channel, bool oldValue, bool newValue)
     {
+        if (channel == LazerIpcChannel.Samples) return;
+
         bool availabilityChanged;
         bool isAvailable;
 

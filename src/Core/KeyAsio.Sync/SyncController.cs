@@ -31,7 +31,8 @@ public class SyncController : IDisposable
         SfxPlaybackService sfxPlaybackService,
         GameplaySessionManager gameplaySessionManager,
         SyncSessionContext syncSessionContext,
-        ISyncExtensionHost extensionHost)
+        ISyncExtensionHost extensionHost,
+        NativeSamplePlaybackService nativeSamples)
     {
         _syncSessionContext = syncSessionContext;
         _extensionHost = extensionHost;
@@ -61,7 +62,7 @@ public class SyncController : IDisposable
         {
             [OsuMemoryStatus.Playing] = new PlayingState(playingStateLogger, appSettings, playbackEngine,
                 beatmapHitsoundLoader, sfxPlaybackService, runtimeState, gameplaySessionManager,
-                gameplayAudioService),
+                gameplayAudioService, nativeSamples),
             [OsuMemoryStatus.ResultsScreen] = new ResultsState(),
             [OsuMemoryStatus.NotRunning] = new NotRunningState(),
             [OsuMemoryStatus.SongSelection] = new BrowsingState(gameplaySessionManager),

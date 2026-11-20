@@ -24,12 +24,14 @@ public class PlayingState : IGameState
     private readonly IPlaybackRuntimeState _runtimeState;
     private readonly GameplaySessionManager _gameplaySessionManager;
     private readonly GameplayAudioService _gameplayAudioService;
+    private readonly NativeSamplePlaybackService? _nativeSamples;
     private readonly List<PlaybackInfo> _playbackBuffer = new(64);
 
     private long _lastHitsoundSyncTimestamp;
     private bool _disableComboBreakSfx;
     private bool? _lastIsReplay;
     private bool _wasAudioPaused;
+    private bool _wasNativeSamples;
 
     public PlayingState(
         ILogger<PlayingState> logger,
@@ -39,7 +41,8 @@ public class PlayingState : IGameState
         SfxPlaybackService sfxPlaybackService,
         IPlaybackRuntimeState runtimeState,
         GameplaySessionManager gameplaySessionManager,
-        GameplayAudioService gameplayAudioService)
+        GameplayAudioService gameplayAudioService,
+        NativeSamplePlaybackService? nativeSamples = null)
     {
         _logger = logger;
         _playbackEngine = playbackEngine;
@@ -48,6 +51,7 @@ public class PlayingState : IGameState
         _runtimeState = runtimeState;
         _gameplaySessionManager = gameplaySessionManager;
         _gameplayAudioService = gameplayAudioService;
+        _nativeSamples = nativeSamples;
 
         _disableComboBreakSfx = appSettings.Sync.Filters.DisableComboBreakSfx;
         appSettings.Sync.Filters.PropertyChanged += (_, e) =>
@@ -79,6 +83,11 @@ public class PlayingState : IGameState
     public void OnTick(SyncSessionContext ctx, int prevMs, int currMs, bool isAudioPaused)
     {
         if (!ctx.IsStarted) return;
+
+        var nativeSamples = _nativeSamples?.IsEnabled == true;
+        if (nativeSamples && !_wasNativeSamples)
+            _sfxPlaybackService.ClearAllLoops(_playbackEngine.EffectMixer);
+        _wasNativeSamples = nativeSamples;
 
         if (_lastIsReplay != ctx.IsReplay)
         {
@@ -178,6 +187,7 @@ public class PlayingState : IGameState
 
     private void PlayAutoPlaybackIfNeeded(SyncSessionContext ctx)
     {
+        if (_nativeSamples?.IsEnabled == true) return;
         if (!_runtimeState.AutoMode &&
             (ctx.PlayMods & Mods.Autoplay) == 0 &&
             (ctx.PlayMods & Mods.Relax) == 0 &&
@@ -203,6 +213,9 @@ public class PlayingState : IGameState
         for (int i = 0; i < count; i++)
         {
             var playbackObject = _playbackBuffer[i];
+            if (_nativeSamples?.IsEnabled == true &&
+                playbackObject.PlaybackEvent is not SampleEvent { Layer: SampleLayer.Sampling })
+                continue;
             if (_gameplaySessionManager.OsuFile.General.Mode == GameMode.Mania &&
                 playbackObject.PlaybackEvent is SampleEvent { Layer: SampleLayer.Sampling })
             {

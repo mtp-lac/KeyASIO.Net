@@ -24,6 +24,7 @@ public sealed class LazerIpcBridge : IDisposable
     private int _clientCount;
     private int _timingClientCount;
     private int _eventClientCount;
+    private int _sampleClientCount;
 
     public LazerIpcBridge(ILogger<LazerIpcBridge> logger)
     {
@@ -36,6 +37,7 @@ public sealed class LazerIpcBridge : IDisposable
 
     public event Action<LazerIpcChannel, bool, bool>? ChannelConnectionChanged;
     public event Action<LazerIpcChannel, LazerDeltaFrame>? FrameReceived;
+    public event Action<LazerSampleFrame>? SamplesReceived;
 
     public void Start()
     {
@@ -46,6 +48,7 @@ public sealed class LazerIpcBridge : IDisposable
         [
             Task.Run(() => AcceptLoopAsync(LazerIpcChannel.Timing, PipeName, _cts.Token)),
             Task.Run(() => AcceptLoopAsync(LazerIpcChannel.Events, EventPipeName, _cts.Token)),
+            Task.Run(() => AcceptLoopAsync(LazerIpcChannel.Samples, LazerSampleProtocol.PipeName, _cts.Token)),
         ];
     }
 
@@ -83,14 +86,18 @@ public sealed class LazerIpcBridge : IDisposable
         while (!token.IsCancellationRequested)
         {
             var server = new NamedPipeServerStream(pipeName, PipeDirection.In,
-                NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte,
-                PipeOptions.Asynchronous);
+                channel == LazerIpcChannel.Samples ? 1 : NamedPipeServerStream.MaxAllowedServerInstances,
+                PipeTransmissionMode.Byte, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
 
             try
             {
                 await server.WaitForConnectionAsync(token);
-                TrackClientTask(Task.Run(() => HandleClientAsync(server, channel, pipeName, token),
-                    CancellationToken.None));
+                var clientTask = Task.Run(() => HandleClientAsync(server, channel, pipeName, token),
+                    CancellationToken.None);
+                if (channel == LazerIpcChannel.Samples)
+                    await clientTask;
+                else
+                    TrackClientTask(clientTask);
             }
             catch (OperationCanceledException)
             {
@@ -148,6 +155,16 @@ public sealed class LazerIpcBridge : IDisposable
             {
                 while (!token.IsCancellationRequested && server.IsConnected)
                 {
+                    if (channel == LazerIpcChannel.Samples)
+                    {
+                        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+                        deadline.CancelAfter(2000);
+                        var sampleFrame = await ReadSampleFrameAsync(server, lengthBuffer, deadline.Token);
+                        if (sampleFrame == null) break;
+                        SamplesReceived?.Invoke(sampleFrame);
+                        continue;
+                    }
+
                     LazerDeltaFrame? frame;
                     try
                     {
@@ -204,6 +221,7 @@ public sealed class LazerIpcBridge : IDisposable
         {
             LazerIpcChannel.Timing => Interlocked.Increment(ref _timingClientCount),
             LazerIpcChannel.Events => Interlocked.Increment(ref _eventClientCount),
+            LazerIpcChannel.Samples => Interlocked.Increment(ref _sampleClientCount),
             _ => throw new ArgumentOutOfRangeException(nameof(channel), channel, null)
         };
     }
@@ -214,6 +232,7 @@ public sealed class LazerIpcBridge : IDisposable
         {
             LazerIpcChannel.Timing => Interlocked.Decrement(ref _timingClientCount),
             LazerIpcChannel.Events => Interlocked.Decrement(ref _eventClientCount),
+            LazerIpcChannel.Samples => Interlocked.Decrement(ref _sampleClientCount),
             _ => throw new ArgumentOutOfRangeException(nameof(channel), channel, null)
         };
     }
@@ -248,6 +267,34 @@ public sealed class LazerIpcBridge : IDisposable
         }
     }
 
+    private static async ValueTask<LazerSampleFrame?> ReadSampleFrameAsync(Stream stream, byte[] lengthBuffer,
+        CancellationToken token)
+    {
+        try
+        {
+            await stream.ReadExactlyAsync(lengthBuffer, token);
+        }
+        catch (EndOfStreamException)
+        {
+            return null;
+        }
+
+        var length = BinaryPrimitives.ReadInt32LittleEndian(lengthBuffer);
+        if (length <= 0 || length > LazerSampleProtocol.MaxFrameLength)
+            throw new InvalidDataException($"Invalid lazer sample frame length: {length}.");
+
+        var buffer = ArrayPool<byte>.Shared.Rent(length);
+        try
+        {
+            await stream.ReadExactlyAsync(buffer.AsMemory(0, length), token);
+            return LazerSampleFrame.Parse(buffer.AsSpan(0, length));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
     public void Dispose()
     {
         StopAsync().GetAwaiter().GetResult();
@@ -258,4 +305,5 @@ public enum LazerIpcChannel
 {
     Timing,
     Events,
+    Samples,
 }

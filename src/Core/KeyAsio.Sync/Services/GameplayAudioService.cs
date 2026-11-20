@@ -11,6 +11,7 @@ using KeyAsio.Core.OsuAudio.Utils;
 using KeyAsio.Sync.Abstractions;
 using Microsoft.Extensions.Logging;
 using NAudio.Wave;
+using OverlayAPI.LazerProtocol;
 
 namespace KeyAsio.Sync.Services;
 
@@ -35,6 +36,9 @@ public class GameplayAudioService : IGameplayAudioCache, IDisposable
     private string? _beatmapFolder;
     private string? _audioFilename;
     private IBeatmapResourceCatalog? _beatmapResourceCatalog;
+    private readonly Dictionary<(long Revision, IBeatmapResourceCatalog? Beatmap, IBeatmapResourceCatalog? Skin,
+        string SkinFolder, string Descriptor), Lazy<Task<CachedAudio?>>> _nativeSampleCache = new();
+    private long _nativeSampleRevision;
 
     private readonly AsyncSequentialWorker _cachingWorker;
     private readonly AsyncSequentialWorker _skinCachingWorker;
@@ -71,24 +75,141 @@ public class GameplayAudioService : IGameplayAudioCache, IDisposable
     private void OnSkinResourcesChanged()
     {
         _logger.LogInformation("Skin resources changed, refreshing gameplay skin audio cache.");
+        ClearNativeSampleCache();
         PrecacheSkinInBackground(invalidateExisting: true);
     }
 
     public void SetContext(string? beatmapFolder, string? audioFilename,
         IBeatmapResourceCatalog? beatmapResourceCatalog = null)
     {
-        _beatmapFolder = beatmapFolder;
-        _audioFilename = audioFilename;
-        _beatmapResourceCatalog = beatmapResourceCatalog;
+        lock (_nativeSampleCache)
+        {
+            _beatmapFolder = beatmapFolder;
+            _audioFilename = audioFilename;
+            _beatmapResourceCatalog = beatmapResourceCatalog;
+            ClearNativeSampleCache();
+        }
     }
 
     public void ClearCaches()
     {
-        _osuAudioFileCache = new OsuAudioFileCache();
-        _audioCacheManager.ClearAll();
-        _playNodeToCachedAudioMapping.Clear();
-        _filenameToCachedAudioMapping.Clear();
+        lock (_nativeSampleCache)
+        {
+            _osuAudioFileCache = new OsuAudioFileCache();
+            _audioCacheManager.ClearAll();
+            _playNodeToCachedAudioMapping.Clear();
+            _filenameToCachedAudioMapping.Clear();
+            ClearNativeSampleCache();
+        }
     }
+
+    private void ClearNativeSampleCache()
+    {
+        lock (_nativeSampleCache)
+        {
+            _nativeSampleRevision++;
+            _nativeSampleCache.Clear();
+        }
+    }
+
+    public Task<CachedAudio?> ResolveNativeSampleAsync(LazerSampleDescriptor sample)
+    {
+        ArgumentNullException.ThrowIfNull(sample);
+        if (_playbackEngine.CurrentDevice == null) return Task.FromResult<CachedAudio?>(null);
+
+        // Snapshot logical names, never retain the per-event descriptor or playback nodes.
+        var names = GetNativeLookupNames(sample.LookupNames).ToArray();
+        if (names.Length == 0) return Task.FromResult<CachedAudio?>(null);
+        Lazy<Task<CachedAudio?>> pending;
+        lock (_nativeSampleCache)
+        {
+            var beatmap = _beatmapResourceCatalog;
+            var skinFolder = _runtimeState.SelectedSkinFolder;
+            _skinResources.TryGetSkinCatalog(skinFolder, out var skin);
+            var useBeatmap = sample.UseBeatmapSamples && !_appSettings.Sync.Filters.DisableBeatmapHitsounds;
+            var format = _playbackEngine.SourceWaveFormat;
+            var descriptor = $"{sample.Volume}:{sample.IsHitsound}:{useBeatmap}:{format}:" + string.Join('\0', names);
+            var key = (_nativeSampleRevision, beatmap, skin, skinFolder, descriptor);
+            if (!_nativeSampleCache.TryGetValue(key, out pending!))
+            {
+                // Bounded to the current context; Lazy also coalesces simultaneous requests.
+                if (_nativeSampleCache.Count >= 256) _nativeSampleCache.Clear();
+                pending = new Lazy<Task<CachedAudio?>>(() => ResolveNativeSampleCoreAsync(
+                    names, useBeatmap ? beatmap : null, skin, skinFolder, format));
+                _nativeSampleCache.Add(key, pending);
+            }
+        }
+
+        // Context may change while loading; the caller must session-check before playing.
+        return pending.Value;
+    }
+
+    private static IEnumerable<string> GetNativeLookupNames(IEnumerable<string>? lookupNames)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var supplied in lookupNames ?? [])
+        {
+            if (string.IsNullOrWhiteSpace(supplied)) continue;
+            var name = supplied.Replace('\\', '/');
+            if (Path.IsPathRooted(name) || name.StartsWith('/') || name.Any(char.IsControl) ||
+                name.IndexOfAny([':', '*', '?', '"', '<', '>', '|']) >= 0 ||
+                name.Split('/').Any(segment => segment is ".." or "." or "" ||
+                    segment.EndsWith('.') || segment.EndsWith(' '))) continue;
+            if (seen.Add(name)) yield return name;
+            if (name.StartsWith("Gameplay/", StringComparison.OrdinalIgnoreCase))
+            {
+                var legacyName = name[(name.LastIndexOf('/') + 1)..];
+                if (seen.Add(legacyName)) yield return legacyName;
+            }
+        }
+    }
+
+    private async Task<CachedAudio?> ResolveNativeSampleCoreAsync(string[] names,
+        IBeatmapResourceCatalog? beatmap, IBeatmapResourceCatalog? skin, string skinFolder, WaveFormat format)
+    {
+        // Finish each resource layer before advancing to the next layer.
+        foreach (var name in names)
+        {
+            if (beatmap?.TryResolveAudio(name, out var resource) == true && File.Exists(resource.Path))
+            {
+                var audio = await LoadAndCacheAudioAsync(resource.Path, BeatmapCacheIdentifier, format);
+                if (IsUsableNativeAudio(audio)) return audio;
+            }
+        }
+
+        foreach (var name in names)
+        {
+            if (skin?.TryResolveAudio(name, out var resource) == true && File.Exists(resource.Path))
+            {
+                var audio = await LoadAndCacheAudioAsync(resource.Path, UserCacheIdentifier, format);
+                if (IsUsableNativeAudio(audio)) return audio;
+            }
+
+            // Virtual skin keys are not directories. Only safe names reach local file lookup.
+            if (!Path.IsPathRooted(skinFolder)) continue;
+            var filenames = Path.HasExtension(name) ? new[] { name } :
+                OsuAudioFileCache.SupportExtensionsInPriorityOrder.Select(extension => name + extension);
+            foreach (var filename in filenames)
+            {
+                var path = Path.Combine(skinFolder, filename);
+                if (!File.Exists(path)) continue;
+                var audio = await LoadAndCacheAudioAsync(path, UserCacheIdentifier, format);
+                if (IsUsableNativeAudio(audio)) return audio;
+            }
+        }
+
+        foreach (var name in names)
+        {
+            var audio = await ResolveAndLoadSkinAudioAsync(name, skinFolder, UserCacheIdentifier, format,
+                createEmptyWhenMissing: false, builtinsOnly: true);
+            if (IsUsableNativeAudio(audio)) return audio;
+        }
+
+        return null;
+    }
+
+    private static bool IsUsableNativeAudio(CachedAudio? audio)
+        => audio is { Length: > 0, IsDisposingOrDisposed: false };
 
     public bool TryGetAudioByNode(PlaybackEvent node, [NotNullWhen(true)] out CachedAudio? cachedAudio)
     {
@@ -353,27 +474,31 @@ public class GameplayAudioService : IGameplayAudioCache, IDisposable
         string skinFolder,
         string category,
         WaveFormat waveFormat,
-        bool createEmptyWhenMissing)
+        bool createEmptyWhenMissing,
+        bool builtinsOnly = false)
     {
-        var filename = _osuAudioFileCache.GetFileUntilFind(skinFolder, filenameKey, out var resourceOwner);
-        if (resourceOwner == ResourceOwner.Beatmap) // Here means file exists in skin folder
+        if (!builtinsOnly)
         {
-            var path = Path.Combine(skinFolder, filename);
-            return await LoadAndCacheAudioAsync(path, category, waveFormat);
-        }
+            var filename = _osuAudioFileCache.GetFileUntilFind(skinFolder, filenameKey, out var resourceOwner);
+            if (resourceOwner == ResourceOwner.Beatmap) // Here means file exists in skin folder
+            {
+                var path = Path.Combine(skinFolder, filename);
+                return await LoadAndCacheAudioAsync(path, category, waveFormat);
+            }
 
-        if (skinFolder == "{internal}")
-        {
-            var dynamicKey = $"internal://dynamic/{filenameKey}";
-            return _audioCacheManager.CreateDynamic(dynamicKey, waveFormat);
-        }
+            if (skinFolder == "{internal}")
+            {
+                var dynamicKey = $"internal://dynamic/{filenameKey}";
+                return _audioCacheManager.CreateDynamic(dynamicKey, waveFormat);
+            }
 
-        // Lazer user skins: resolve via the skin's resource catalog (file-to-path mappings
-        // received from the lazer IPC). The skinFolder is a virtual key, not a real directory.
-        if (_skinResources.TryGetSkinCatalog(skinFolder, out var skinCatalog) &&
-            skinCatalog.TryResolveAudio(filenameKey, out var skinResource))
-        {
-            return await LoadAndCacheAudioAsync(skinResource.Path, category, waveFormat);
+            // Lazer user skins: resolve via the skin's resource catalog (file-to-path mappings
+            // received from the lazer IPC). The skinFolder is a virtual key, not a real directory.
+            if (_skinResources.TryGetSkinCatalog(skinFolder, out var skinCatalog) &&
+                skinCatalog.TryResolveAudio(filenameKey, out var skinResource))
+            {
+                return await LoadAndCacheAudioAsync(skinResource.Path, category, waveFormat);
+            }
         }
 
         // Lazer built-in skins: use per-skin extracted resources with classic → triangles fallback.
@@ -448,6 +573,7 @@ public class GameplayAudioService : IGameplayAudioCache, IDisposable
 
     public void Dispose()
     {
+        ClearNativeSampleCache();
         _runtimeState.SelectedSkinChanged -= OnSelectedSkinChanged;
         _skinResources.ResourcesChanged -= OnSkinResourcesChanged;
         _cachingWorker.Dispose();
