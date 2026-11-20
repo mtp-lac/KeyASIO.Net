@@ -26,6 +26,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Apps\KeyAsio\KeyAsio.csproj" />
     <ProjectReference Include="..\..\src\Common\KeyAsio.Common\KeyAsio.Common.csproj" />
+    <ProjectReference Include="..\..\src\Common\KeyAsio.Secrets\KeyAsio.Secrets.csproj" />
   </ItemGroup>
 
   <ItemGroup>
